@@ -432,6 +432,33 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
             d.Low = crate::insn::insertq(d.Low, s.Low, len, idx);
             d.High = 0;
         }
+        // xmm1 = SHA(xmm1, xmm2 / m128, XMM0); lanes are the register's four dwords, low first
+        ConsoleOnly::Sha { op, dst, src } => {
+            let lanes = |lo: u64, hi: u64| [lo as u32, (lo >> 32) as u32, hi as u32, (hi >> 32) as u32];
+            let b = match src {
+                crate::insn::Operand::Xmm(s) => {
+                    let s = &ctx.Anonymous.FltSave.XmmRegisters[s as usize & 15];
+                    lanes(s.Low, s.High as u64)
+                }
+                crate::insn::Operand::Mem(m) => {
+                    let regs = [
+                        ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.Rbx, ctx.Rsp, ctx.Rbp, ctx.Rsi, ctx.Rdi,
+                        ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15,
+                    ];
+                    let at = m.address(&regs, ctx.Rip + len as u64) as usize;
+                    if !crate::gpu::shader::readable(at, 16) {
+                        return 0; // the real instruction faults there too
+                    }
+                    std::ptr::read_unaligned(at as *const [u32; 4])
+                }
+            };
+            let x = &mut ctx.Anonymous.FltSave.XmmRegisters;
+            let (d, x0) = (&x[dst as usize & 15], &x[0]);
+            let r = crate::insn::sha(op, lanes(d.Low, d.High as u64), b, lanes(x0.Low, x0.High as u64));
+            let d = &mut x[dst as usize & 15];
+            d.Low = r[0] as u64 | (r[1] as u64) << 32;
+            d.High = (r[2] as u64 | (r[3] as u64) << 32) as _;
+        }
     }
     ctx.Rip += step as u64;
     -1 // EXCEPTION_CONTINUE_EXECUTION

@@ -29,8 +29,121 @@ pub enum ConsoleOnly {
     /// the length and index in xmm2's bits 69:64 and 77:72): the low bits of xmm2 put into a
     /// bit field of xmm1's low quadword.
     Insertq { dst: u8, src: u8, reg: bool, len: u8, idx: u8 },
+    /// A SHA extension instruction (Intel has them from Ice Lake / Rocket Lake on): `dst` is
+    /// xmm1, also the first source, `src` xmm2 / m128 ([`sha`] runs it).
+    Sha { op: ShaOp, dst: u8, src: Operand },
     /// `ud2`: the title's own trap (not emulated)
     Ud2,
+}
+
+/// The SHA instructions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShaOp {
+    /// `sha1rnds4 xmm1, xmm2/m128, imm8`: four SHA-1 rounds of the group imm8 (0..3)
+    Sha1Rnds4(u8),
+    Sha1Nexte,
+    Sha1Msg1,
+    Sha1Msg2,
+    /// `sha256rnds2 xmm1, xmm2/m128, <XMM0>`: two SHA-256 rounds, their W + K in XMM0's low
+    /// quadword
+    Sha256Rnds2,
+    Sha256Msg1,
+    Sha256Msg2,
+}
+
+/// An XMM register or a memory operand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operand {
+    Xmm(u8),
+    Mem(MemRef),
+}
+
+/// A ModRM memory operand with 64-bit addressing: `base + index * scale + disp`, or `rip + disp`
+/// (`rip`: the address of the next instruction). Registers in CONTEXT order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemRef {
+    pub base: Option<u8>,
+    pub index: Option<u8>,
+    pub scale: u8,
+    pub disp: i32,
+    pub rip: bool,
+}
+
+impl MemRef {
+    /// The address, with `regs` the 16 general registers (CONTEXT order) and `next` the address
+    /// of the instruction after this one.
+    pub fn address(&self, regs: &[u64; 16], next: u64) -> u64 {
+        let mut a = if self.rip { next } else { self.base.map_or(0, |b| regs[b as usize & 15]) };
+        if let Some(x) = self.index {
+            a = a.wrapping_add(regs[x as usize & 15].wrapping_mul(self.scale as u64));
+        }
+        a.wrapping_add(self.disp as i64 as u64)
+    }
+}
+
+/// A SHA instruction on XMM lanes (lane 0 is bits 31:0): `a` is xmm1, `b` xmm2 / m128 and `xmm0`
+/// XMM0 (SHA256RNDS2's W + K); the result is xmm1's new value. As Intel's SDM gives them.
+pub fn sha(op: ShaOp, a: [u32; 4], b: [u32; 4], xmm0: [u32; 4]) -> [u32; 4] {
+    let s0 = |w: u32| w.rotate_right(7) ^ w.rotate_right(18) ^ (w >> 3);
+    let s1 = |w: u32| w.rotate_right(17) ^ w.rotate_right(19) ^ (w >> 10);
+    match op {
+        ShaOp::Sha1Rnds4(f) => {
+            let k = [0x5A82_7999u32, 0x6ED9_EBA1, 0x8F1B_BCDC, 0xCA62_C1D6][f as usize & 3];
+            let fun = |b: u32, c: u32, d: u32| match f & 3 {
+                0 => (b & c) ^ (!b & d),
+                2 => (b & c) ^ (b & d) ^ (c & d),
+                _ => b ^ c ^ d,
+            };
+            // A B C D from lanes 3..0, W0 + E then W1..W3 from b's lanes 3..0 (E is 0 in round 0)
+            let (mut s, mut e) = ([a[3], a[2], a[1], a[0]], 0u32);
+            for w in [b[3], b[2], b[1], b[0]] {
+                let [sa, sb, sc, sd] = s;
+                let t = fun(sb, sc, sd).wrapping_add(sa.rotate_left(5)).wrapping_add(w).wrapping_add(e).wrapping_add(k);
+                e = sd;
+                s = [t, sa, sb.rotate_left(30), sc];
+            }
+            [s[3], s[2], s[1], s[0]]
+        }
+        ShaOp::Sha1Nexte => [b[0], b[1], b[2], b[3].wrapping_add(a[3].rotate_left(30))],
+        ShaOp::Sha1Msg1 => [b[2] ^ a[0], b[3] ^ a[1], a[0] ^ a[2], a[1] ^ a[3]],
+        ShaOp::Sha1Msg2 => {
+            let w16 = (a[3] ^ b[2]).rotate_left(1);
+            let w17 = (a[2] ^ b[1]).rotate_left(1);
+            let w18 = (a[1] ^ b[0]).rotate_left(1);
+            let w19 = (a[0] ^ w16).rotate_left(1);
+            [w19, w18, w17, w16]
+        }
+        ShaOp::Sha256Rnds2 => {
+            // A B E F in b's lanes 3, 2, 1, 0; C D G H in a's
+            let [mut h, mut g, mut d, mut c] = a;
+            let [mut f, mut e, mut bb, mut aa] = b;
+            for wk in [xmm0[0], xmm0[1]] {
+                let ch = (e & f) ^ (!e & g);
+                let maj = (aa & bb) ^ (aa & c) ^ (bb & c);
+                let sum0 = aa.rotate_right(2) ^ aa.rotate_right(13) ^ aa.rotate_right(22);
+                let sum1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+                let t = ch.wrapping_add(sum1).wrapping_add(wk).wrapping_add(h);
+                (h, g, f) = (g, f, e);
+                e = t.wrapping_add(d);
+                (d, c, bb) = (c, bb, aa);
+                aa = t.wrapping_add(maj).wrapping_add(sum0);
+            }
+            [f, e, bb, aa]
+        }
+        ShaOp::Sha256Msg1 => [
+            a[0].wrapping_add(s0(a[1])),
+            a[1].wrapping_add(s0(a[2])),
+            a[2].wrapping_add(s0(a[3])),
+            a[3].wrapping_add(s0(b[0])),
+        ],
+        ShaOp::Sha256Msg2 => {
+            let w16 = a[0].wrapping_add(s1(b[2]));
+            let w17 = a[1].wrapping_add(s1(b[3]));
+            let w18 = a[2].wrapping_add(s1(w16));
+            let w19 = a[3].wrapping_add(s1(w17));
+            [w16, w17, w18, w19]
+        }
+    }
 }
 
 /// A field length of SSE4a's six bits: 0 is 64.
@@ -82,6 +195,62 @@ fn modrm_len(b: &[u8]) -> Option<usize> {
         _ => 4,
     };
     (b.len() >= len).then_some(len)
+}
+
+/// The ModRM operand at `b[0]` with 64-bit addressing (`rex`: the REX byte, 0 without one) and
+/// its length (ModRM, SIB and displacement): an XMM register for mod 3.
+fn operand(b: &[u8], rex: u8) -> Option<(Operand, usize)> {
+    let len = modrm_len(b)?;
+    let (md, rm) = (b[0] >> 6, b[0] & 7);
+    let (rex_b, rex_x) = ((rex & 1) << 3, (rex & 2) << 2);
+    if md == 3 {
+        return Some((Operand::Xmm(rm | rex_b), 1));
+    }
+    let sib = (rm == 4).then(|| b[1]);
+    let d = &b[1 + sib.is_some() as usize..len];
+    let disp = match *d {
+        [] => 0,
+        [d8] => d8 as i8 as i32,
+        [d0, d1, d2, d3] => i32::from_le_bytes([d0, d1, d2, d3]),
+        _ => return None,
+    };
+    let m = match sib {
+        None if md == 0 && rm == 5 => MemRef { base: None, index: None, scale: 1, disp, rip: true },
+        None => MemRef { base: Some(rm | rex_b), index: None, scale: 1, disp, rip: false },
+        // index 4 (rsp) is none; base 5 under mod 0 is none, with a disp32
+        Some(s) => {
+            let index = ((s >> 3) & 7) | rex_x;
+            let base = s & 7;
+            MemRef {
+                base: (md != 0 || base != 5).then_some(base | rex_b),
+                index: (index != 4).then_some(index),
+                scale: 1 << (s >> 6),
+                disp,
+                rip: false,
+            }
+        }
+    };
+    Some((Operand::Mem(m), len))
+}
+
+/// A SHA instruction with its ModRM at `code[i + 3]` (`i`: where its 0F is), an imm8 after the
+/// operand for SHA1RNDS4. A memory operand only with 64-bit addressing and without FS / GS.
+fn decode_sha(code: &[u8], i: usize, rex: u8, op: ShaOp) -> Option<(ConsoleOnly, usize)> {
+    let m = *code.get(i + 3)?;
+    let (src, len) = operand(&code[i + 3..], rex)?;
+    if matches!(src, Operand::Mem(_)) && code[..i].iter().any(|b| matches!(b, 0x64 | 0x65 | 0x67)) {
+        return None;
+    }
+    let dst = ((m >> 3) & 7) | (rex & 4) << 1;
+    let mut end = i + 3 + len;
+    let op = match op {
+        ShaOp::Sha1Rnds4(_) => {
+            end += 1;
+            ShaOp::Sha1Rnds4(*code.get(end - 1)? & 3)
+        }
+        op => op,
+    };
+    Some((ConsoleOnly::Sha { op, dst, src }, end))
 }
 
 /// The console-only instruction at the start of `code` and its length.
@@ -153,6 +322,13 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
                 _ => None,
             }
         }
+        // SHA: NP 0F 38 C8..CD /r and NP 0F 3A CC /r ib (with 66 / F2 / F3 they are other
+        // instructions or #UD)
+        (0x38, Some(o @ 0xC8..=0xCD)) if !p66 && rep == 0 => {
+            let op = [ShaOp::Sha1Nexte, ShaOp::Sha1Msg1, ShaOp::Sha1Msg2, ShaOp::Sha256Rnds2, ShaOp::Sha256Msg1, ShaOp::Sha256Msg2];
+            decode_sha(code, i, rex, op[(o - 0xC8) as usize])
+        }
+        (0x3A, Some(0xCC)) if !p66 && rep == 0 => decode_sha(code, i, rex, ShaOp::Sha1Rnds4(0)),
         // 66 0F AE /6 with a memory operand (without 66 it is xsaveopt)
         (0xAE, Some(m)) if p66 && (m >> 3) & 7 == 6 && m >> 6 != 3 => Some((ConsoleOnly::Clwb, i + 2 + modrm_len(&code[i + 2..])?)),
         // F3 0F C7 /7 with a register operand
@@ -239,5 +415,123 @@ mod tests {
         assert_eq!(decode(&[0x48, 0x8B, 0x01]), None);
         assert_eq!(decode(&[0x66, 0x0F, 0xAE, 0x74, 0x24]), None);
         assert_eq!(decode(&[0x0F]), None);
+    }
+
+    /// SHA instructions as GNU as 2.42 encodes them, register and memory forms.
+    #[test]
+    fn decodes_sha() {
+        let mem = |base, index, scale, disp| Operand::Mem(MemRef { base, index, scale, disp, rip: false });
+        let sha = |op, dst, src, len| Some((ConsoleOnly::Sha { op, dst, src }, len));
+        use ShaOp::*;
+        // sha1rnds4 xmm1, xmm2, 3; sha1rnds4 xmm9, [rip+0x100], 1
+        assert_eq!(decode(&[0x0F, 0x3A, 0xCC, 0xCA, 0x03]), sha(Sha1Rnds4(3), 1, Operand::Xmm(2), 5));
+        let rip = MemRef { base: None, index: None, scale: 1, disp: 0x100, rip: true };
+        assert_eq!(decode(&[0x44, 0x0F, 0x3A, 0xCC, 0x0D, 0x00, 0x01, 0x00, 0x00, 0x01]), sha(Sha1Rnds4(1), 9, Operand::Mem(rip), 10));
+        // sha1nexte xmm3, xmm12; sha1msg1 xmm0, [rax]; sha1msg2 xmm15, [rsp+8]; sha256rnds2 xmm1, xmm2
+        assert_eq!(decode(&[0x41, 0x0F, 0x38, 0xC8, 0xDC]), sha(Sha1Nexte, 3, Operand::Xmm(12), 5));
+        assert_eq!(decode(&[0x0F, 0x38, 0xC9, 0x00]), sha(Sha1Msg1, 0, mem(Some(0), None, 1, 0), 4));
+        assert_eq!(decode(&[0x44, 0x0F, 0x38, 0xCA, 0x7C, 0x24, 0x08]), sha(Sha1Msg2, 15, mem(Some(4), None, 1, 8), 7));
+        assert_eq!(decode(&[0x0F, 0x38, 0xCB, 0xCA]), sha(Sha256Rnds2, 1, Operand::Xmm(2), 4));
+        // sha256msg1 xmm4, [r13+rcx*4-0x10]; sha256msg2 xmm5, [rbx+r12*8+0x12345678]
+        let m1 = mem(Some(13), Some(1), 4, -0x10);
+        let m2 = mem(Some(3), Some(12), 8, 0x1234_5678);
+        assert_eq!(decode(&[0x41, 0x0F, 0x38, 0xCC, 0x64, 0x8D, 0xF0]), sha(Sha256Msg1, 4, m1, 7));
+        assert_eq!(decode(&[0x42, 0x0F, 0x38, 0xCD, 0xAC, 0xE3, 0x78, 0x56, 0x34, 0x12]), sha(Sha256Msg2, 5, m2, 10));
+        // sha256msg1 xmm6, [r12] (a SIB without an index); sha256msg2 xmm7, [r13+0]; sha1msg1 xmm2, [0x1000]
+        assert_eq!(decode(&[0x41, 0x0F, 0x38, 0xCC, 0x34, 0x24]), sha(Sha256Msg1, 6, mem(Some(12), None, 1, 0), 6));
+        assert_eq!(decode(&[0x41, 0x0F, 0x38, 0xCD, 0x7D, 0x00]), sha(Sha256Msg2, 7, mem(Some(13), None, 1, 0), 6));
+        assert_eq!(decode(&[0x0F, 0x38, 0xC9, 0x14, 0x25, 0x00, 0x10, 0x00, 0x00]), sha(Sha1Msg1, 2, mem(None, None, 1, 0x1000), 9));
+        // FS / GS and 32-bit addressing are not emulated for a memory operand; a register one has no address
+        assert_eq!(decode(&[0x64, 0x0F, 0x38, 0xC9, 0x00]), None);
+        assert_eq!(decode(&[0x67, 0x0F, 0x38, 0xC9, 0x00]), None);
+        assert_eq!(decode(&[0x64, 0x0F, 0x38, 0xC9, 0xC1]), sha(Sha1Msg1, 0, Operand::Xmm(1), 5));
+        // with 66 / F3 they are not SHA; truncated: the imm8, the disp32
+        assert_eq!(decode(&[0x66, 0x0F, 0x38, 0xC8, 0xC1]), None);
+        assert_eq!(decode(&[0xF3, 0x0F, 0x38, 0xC8, 0xC1]), None);
+        assert_eq!(decode(&[0x0F, 0x3A, 0xCC, 0xCA]), None);
+        assert_eq!(decode(&[0x0F, 0x38, 0xC9, 0x14, 0x25, 0x00, 0x10]), None);
+        // the addresses, with register k holding 0x10000 * (k + 1)
+        let regs: [u64; 16] = std::array::from_fn(|k| 0x1_0000 * (k as u64 + 1));
+        let addr = |o: Operand| match o {
+            Operand::Mem(m) => m.address(&regs, 0x40_0000),
+            Operand::Xmm(_) => unreachable!(),
+        };
+        assert_eq!(addr(m1), 0xE_0000 + 4 * 0x2_0000 - 0x10);
+        assert_eq!(addr(m2), 0x4_0000 + 8 * 0xD_0000 + 0x1234_5678);
+        assert_eq!(addr(Operand::Mem(rip)), 0x40_0100);
+        assert_eq!(addr(mem(None, None, 1, 0x1000)), 0x1000);
+    }
+
+    /// xorshift64*: test inputs
+    fn rng(s: &mut u64) -> u32 {
+        *s ^= *s >> 12;
+        *s ^= *s << 25;
+        *s ^= *s >> 27;
+        (s.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32
+    }
+
+    const SHA_OPS: [ShaOp; 10] = [
+        ShaOp::Sha1Rnds4(0), ShaOp::Sha1Rnds4(1), ShaOp::Sha1Rnds4(2), ShaOp::Sha1Rnds4(3), ShaOp::Sha1Nexte,
+        ShaOp::Sha1Msg1, ShaOp::Sha1Msg2, ShaOp::Sha256Rnds2, ShaOp::Sha256Msg1, ShaOp::Sha256Msg2,
+    ];
+
+    /// `n` random inputs from `seed`: xmm1, xmm2, XMM0
+    fn sha_inputs(seed: u64, n: usize) -> impl Iterator<Item = [[u32; 4]; 3]> {
+        let mut s = 0x5EED_0000_0000_0001 ^ seed;
+        (0..n).map(move |_| {
+            let mut v = [[0u32; 4]; 3];
+            v.iter_mut().flatten().for_each(|x| *x = rng(&mut s));
+            v
+        })
+    }
+
+    /// The emulated SHA instructions against what a CPU with them returned (an Intel Xeon with
+    /// SHA-NI, Linux): an FNV-1a hash of 256 results of each, so a PC without SHA checks them too.
+    #[test]
+    fn sha_matches_recorded_cpu_results() {
+        let want: [u64; 10] = [
+            0xDF4F_D800_7FFF_C390, 0x0C71_5E2F_4FF5_C574, 0x984C_4739_DE9E_93CB, 0xF78F_0DA0_7479_C944, 0x900E_8D9F_6EC0_23DD,
+            0xC498_F328_AEBD_D36F, 0xE447_23C7_D074_00F9, 0x7475_CEBE_4F99_8D18, 0xFF6B_5B00_D9E8_75F3, 0x8C82_15BD_D1A5_4E4B,
+        ];
+        for (k, op) in SHA_OPS.into_iter().enumerate() {
+            let mut h = 0xCBF2_9CE4_8422_2325u64;
+            for [a, b, x0] in sha_inputs(k as u64, 256) {
+                for w in sha(op, a, b, x0) {
+                    h = (h ^ w as u64).wrapping_mul(0x100_0000_01B3);
+                }
+            }
+            assert_eq!(h, want[k], "{op:?}");
+        }
+    }
+
+    /// The emulation against this CPU's own SHA instructions, when it has them (AMD's; Intel's
+    /// from Ice Lake / Rocket Lake on).
+    #[test]
+    fn sha_matches_this_cpu() {
+        if !std::arch::is_x86_feature_detected!("sha") {
+            return;
+        }
+        #[target_feature(enable = "sha")]
+        unsafe fn cpu(op: ShaOp, a: [u32; 4], b: [u32; 4], x0: [u32; 4]) -> [u32; 4] {
+            use std::arch::x86_64::*;
+            let (a, b, k): (__m128i, __m128i, __m128i) = (std::mem::transmute(a), std::mem::transmute(b), std::mem::transmute(x0));
+            std::mem::transmute(match op {
+                ShaOp::Sha1Rnds4(0) => _mm_sha1rnds4_epu32(a, b, 0),
+                ShaOp::Sha1Rnds4(1) => _mm_sha1rnds4_epu32(a, b, 1),
+                ShaOp::Sha1Rnds4(2) => _mm_sha1rnds4_epu32(a, b, 2),
+                ShaOp::Sha1Rnds4(_) => _mm_sha1rnds4_epu32(a, b, 3),
+                ShaOp::Sha1Nexte => _mm_sha1nexte_epu32(a, b),
+                ShaOp::Sha1Msg1 => _mm_sha1msg1_epu32(a, b),
+                ShaOp::Sha1Msg2 => _mm_sha1msg2_epu32(a, b),
+                ShaOp::Sha256Rnds2 => _mm_sha256rnds2_epu32(a, b, k),
+                ShaOp::Sha256Msg1 => _mm_sha256msg1_epu32(a, b),
+                ShaOp::Sha256Msg2 => _mm_sha256msg2_epu32(a, b),
+            })
+        }
+        for (k, op) in SHA_OPS.into_iter().enumerate() {
+            for [a, b, x0] in sha_inputs(0x100 + k as u64, 10_000) {
+                assert_eq!(sha(op, a, b, x0), unsafe { cpu(op, a, b, x0) }, "{op:?} on {a:08x?} {b:08x?} {x0:08x?}");
+            }
+        }
     }
 }
