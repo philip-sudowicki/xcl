@@ -446,6 +446,9 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
                         ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15,
                     ];
                     let at = m.address(&regs, ctx.Rip + len as u64) as usize;
+                    // a lazy physical page is reserved until its first use, which faults: not
+                    // from inside this handler – committed first, as for XCL's own writes
+                    crate::hle::kernelx::lazy::ensure(at, 16);
                     if !crate::gpu::shader::readable(at, 16) {
                         return 0; // the real instruction faults there too
                     }
